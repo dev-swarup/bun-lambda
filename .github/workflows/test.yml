@@ -44,7 +44,7 @@ jobs:
           set -euo pipefail
           EXTRACT_DIR=$(mktemp -d)
           unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
-          chmod +x "${EXTRACT_DIR}/bootstrap"
+          chmod -R 755 "${EXTRACT_DIR}"
 
           docker run --rm -d -p 9000:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-classic-runner public.ecr.aws/lambda/provided:al2023 bootstrap
 
@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           EXTRACT_DIR=$(mktemp -d)
           unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
-          chmod +x "${EXTRACT_DIR}/bootstrap"
+          chmod -R 755 "${EXTRACT_DIR}"
 
           docker run --rm -d -p 9001:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-fetch-runner public.ecr.aws/lambda/provided:al2023 bootstrap
 
@@ -112,9 +112,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up QEMU for ARM64 emulation
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y qemu-user-static binfmt-support
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Build bootstrap zip
         id: build
@@ -142,7 +142,7 @@ jobs:
           set -euo pipefail
           EXTRACT_DIR=$(mktemp -d)
           unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
-          chmod +x "${EXTRACT_DIR}/bootstrap"
+          chmod -R 755 "${EXTRACT_DIR}"
 
           docker run --rm -d --platform linux/arm64 -p 9002:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-arm64-runner public.ecr.aws/lambda/provided:al2023 bootstrap
 
@@ -174,12 +174,15 @@ jobs:
           mkdir -p /tmp/fixture-app/templates
 
           cat > /tmp/fixture-app/index.ts << 'EOF'
-          import config from "./config/app.json";
+          import { readFileSync } from "fs";
 
           export const handler = async (event: any) => {
+            const config = JSON.parse(readFileSync("./config/app.json", "utf-8"));
+            const template = readFileSync("./templates/index.html", "utf-8");
             return {
               statusCode: 200,
               appName: config.name,
+              template: template.trim(),
               received: event,
             };
           };
@@ -187,7 +190,7 @@ jobs:
 
           echo '{"name": "bun-lambda-fixture"}' > /tmp/fixture-app/config/app.json
           echo '{"name":"fixture-app"}' > /tmp/fixture-app/package.json
-          echo '<h1>Hello {{name}}</h1>' > /tmp/fixture-app/templates/index.html
+          echo '<h1>Hello from template</h1>' > /tmp/fixture-app/templates/index.html
 
       - name: Build with multiline files list & sourcemap
         id: build
@@ -220,7 +223,7 @@ jobs:
           set -euo pipefail
           EXTRACT_DIR=$(mktemp -d)
           unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
-          chmod +x "${EXTRACT_DIR}/bootstrap"
+          chmod -R 755 "${EXTRACT_DIR}"
 
           docker run --rm -d -p 9003:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-fixture-runner public.ecr.aws/lambda/provided:al2023 bootstrap
 
@@ -237,4 +240,5 @@ jobs:
 
           [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
           grep -q "bun-lambda-fixture" /tmp/response-fixture.json || { echo "Response did not match"; exit 1; }
-          echo "Fixture bundle verified working on Lambda, config file was loaded correctly."
+          grep -q "Hello from template" /tmp/response-fixture.json || { echo "Template content did not match"; exit 1; }
+          echo "Fixture bundle verified working on Lambda, config and template files loaded dynamically from disk."
