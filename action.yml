@@ -1,0 +1,57 @@
+name: 'bun-lambda'
+author: 'dev-swarup'
+description: 'Compiles Bun applications into standalone, bytecode-optimized bootstrap binaries for lowest cold-start AWS Lambda.'
+
+branding:
+  icon: 'zap'
+  color: 'orange'
+
+inputs:
+  bun-version:
+    default: 'latest'
+    required: false
+    description: 'Target Bun compiler version (e.g. "1.2.0" or "latest").'
+  arch:
+    default: 'x86_64'
+    required: false
+    description: 'Target instruction architecture for the compiled binary ("x86_64" or "arm64").'
+  output:
+    default: 'bootstrap.zip'
+    required: false
+    description: 'Destination file path for the deployable Lambda artifact.'
+  dir:
+    default: '.'
+    required: false
+    description: 'Working directory containing handler source code and dependency manifests.'
+  handler:
+    default: 'index.handler'
+    required: false
+    description: 'Entrypoint handler signature (e.g. "index.handler" or "src/app.fetch") resolved and bound at compile time.'
+  sourcemap:
+    default: 'false'
+    required: false
+    description: 'Emit inline source maps into the binary for deterministic production stack traces.'
+  files:
+    default: ''
+    required: false
+    description: 'Static assets, engines, or config glob patterns to bundle in the deployment root (YAML list or newline-separated).'
+
+outputs:
+  path:
+    value: ${{ steps.package.outputs.zip-path }}
+    description: 'Absolute path to the packaged Lambda deployment zip.'
+  size:
+    value: ${{ steps.package.outputs.binary-size }}
+    description: 'Binary size of the compiled standalone bootstrap executable.'
+  version:
+    value: ${{ steps.setup-bun.outputs.bun-version }}
+    description: 'Resolved Bun compiler version utilized during the build.'
+
+runs:
+  using: 'composite'
+  steps:
+    - id: setup-bun
+      name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
