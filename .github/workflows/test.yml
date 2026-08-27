@@ -1,0 +1,240 @@
+name: Test bun-lambda Action
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-classic-handler:
+    name: E2E Test - Classic Handler (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build bootstrap zip
+        id: build
+        uses: ./
+        with:
+          arch: 'x86_64'
+          dir: 'examples/basic'
+          bun-version: 'latest'
+          output: 'dist/bootstrap-classic.zip'
+          handler: 'handler.handler'
+
+      - name: Verify zip contents
+        run: |
+          set -euo pipefail
+          echo "Zip size: ${{ steps.build.outputs.size }}"
+          echo "Zip path: ${{ steps.build.outputs.path }}"
+
+          [ -f "${{ steps.build.outputs.path }}" ] || { echo "Zip not found"; exit 1; }
+
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+
+          [ -x "${EXTRACT_DIR}/bootstrap" ] || { echo "bootstrap is not executable"; exit 1; }
+          file "${EXTRACT_DIR}/bootstrap" | grep -qi "ELF 64-bit" || { echo "Not an ELF 64-bit binary"; exit 1; }
+          echo "Binary verified as standalone ELF executable."
+
+      - name: Run on real Lambda image (RIE) and invoke it
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+          chmod +x "${EXTRACT_DIR}/bootstrap"
+
+          docker run --rm -d -p 9000:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-classic-runner public.ecr.aws/lambda/provided:al2023 bootstrap
+
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /tmp/response-classic.json -w "%{http_code}" -XPOST "http://localhost:9000/2015-03-31/functions/function/invocations" -d '{"httpMethod": "GET", "path": "/test"}')
+
+          docker logs lambda-classic-runner
+          docker stop lambda-classic-runner
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat /tmp/response-classic.json
+          echo ""
+
+          [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
+          grep -q "Hello from Bun on Lambda" /tmp/response-classic.json || { echo "Response did not match"; exit 1; }
+          echo "Classic handler verified working on Lambda."
+
+  test-fetch-handler:
+    name: E2E Test - Fetch-Style Handler (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build bootstrap zip
+        id: build
+        uses: ./
+        with:
+          bun-version: 'latest'
+          arch: 'x86_64'
+          output: 'dist/bootstrap-fetch.zip'
+          dir: 'examples/fetch-style'
+          handler: 'index'
+
+      - name: Run on real Lambda image (RIE) and invoke it
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+          chmod +x "${EXTRACT_DIR}/bootstrap"
+
+          docker run --rm -d -p 9001:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-fetch-runner public.ecr.aws/lambda/provided:al2023 bootstrap
+
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /tmp/response-fetch.json -w "%{http_code}" -XPOST "http://localhost:9001/2015-03-31/functions/function/invocations" -d '{"action": "test-fetch-api"}')
+
+          docker logs lambda-fetch-runner
+          docker stop lambda-fetch-runner
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat /tmp/response-fetch.json
+          echo ""
+
+          [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
+          grep -q "Hello from Bun fetch handler on Lambda" /tmp/response-fetch.json || { echo "Response did not match"; exit 1; }
+          echo "Fetch handler verified working on Lambda."
+
+  test-arm64:
+    name: E2E Test - ARM64 / Graviton
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for ARM64 emulation
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y qemu-user-static binfmt-support
+
+      - name: Build bootstrap zip
+        id: build
+        uses: ./
+        with:
+          bun-version: 'latest'
+          arch: 'arm64'
+          output: 'dist/bootstrap-arm64.zip'
+          dir: 'examples/basic'
+          handler: 'handler.handler'
+
+      - name: Verify ARM64 binary
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+
+          FILE_INFO=$(file "${EXTRACT_DIR}/bootstrap")
+          echo "${FILE_INFO}"
+          echo "${FILE_INFO}" | grep -qi "aarch64" || { echo "Expected aarch64 binary"; exit 1; }
+          echo "Verified as aarch64 ELF binary."
+
+      - name: Run on real Lambda image (RIE, emulated) and invoke it
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+          chmod +x "${EXTRACT_DIR}/bootstrap"
+
+          docker run --rm -d --platform linux/arm64 -p 9002:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-arm64-runner public.ecr.aws/lambda/provided:al2023 bootstrap
+
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /tmp/response-arm64.json -w "%{http_code}" -XPOST "http://localhost:9002/2015-03-31/functions/function/invocations" -d '{"arch": "arm64-test"}')
+
+          docker logs lambda-arm64-runner
+          docker stop lambda-arm64-runner
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat /tmp/response-arm64.json
+          echo ""
+
+          [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
+          grep -q "Hello from Bun on Lambda" /tmp/response-arm64.json || { echo "Response did not match"; exit 1; }
+          echo "ARM64 bootstrap verified working on Lambda."
+
+  test-extra-files-and-sourcemap:
+    name: Test - Static Files Bundling & Sourcemaps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create fixture app with extra assets
+        run: |
+          mkdir -p /tmp/fixture-app/config
+          mkdir -p /tmp/fixture-app/templates
+
+          cat > /tmp/fixture-app/index.ts << 'EOF'
+          import config from "./config/app.json";
+
+          export const handler = async (event: any) => {
+            return {
+              statusCode: 200,
+              appName: config.name,
+              received: event,
+            };
+          };
+          EOF
+
+          echo '{"name": "bun-lambda-fixture"}' > /tmp/fixture-app/config/app.json
+          echo '{"name":"fixture-app"}' > /tmp/fixture-app/package.json
+          echo '<h1>Hello {{name}}</h1>' > /tmp/fixture-app/templates/index.html
+
+      - name: Build with multiline files list & sourcemap
+        id: build
+        uses: ./
+        with:
+          arch: 'x86_64'
+          output: 'dist/bootstrap-fixture.zip'
+          dir: '/tmp/fixture-app'
+          handler: 'index.handler'
+          sourcemap: 'true'
+          files: |
+            - config/*.json
+            - templates/**/*.html
+
+      - name: Verify bundled files and inline sourcemap
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+
+          [ -f "${EXTRACT_DIR}/config/app.json" ] || { echo "config/app.json missing"; exit 1; }
+          [ -f "${EXTRACT_DIR}/templates/index.html" ] || { echo "templates/index.html missing"; exit 1; }
+          echo "All extra files bundled in zip."
+
+          strings "${EXTRACT_DIR}/bootstrap" | grep -q "sourceMappingURL" || { echo "sourceMappingURL missing"; exit 1; }
+          echo "Inline sourcemap verified in bootstrap binary."
+
+      - name: Run on real Lambda image (RIE) and invoke it
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+          chmod +x "${EXTRACT_DIR}/bootstrap"
+
+          docker run --rm -d -p 9003:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-fixture-runner public.ecr.aws/lambda/provided:al2023 bootstrap
+
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /tmp/response-fixture.json -w "%{http_code}" -XPOST "http://localhost:9003/2015-03-31/functions/function/invocations" -d '{"ping": "pong"}')
+
+          docker logs lambda-fixture-runner
+          docker stop lambda-fixture-runner
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat /tmp/response-fixture.json
+          echo ""
+
+          [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
+          grep -q "bun-lambda-fixture" /tmp/response-fixture.json || { echo "Response did not match"; exit 1; }
+          echo "Fixture bundle verified working on Lambda, config file was loaded correctly."
