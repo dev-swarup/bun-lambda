@@ -67,14 +67,34 @@ interface ResolvedHandler {
  */
 function resolveHandler(mod: Record<string, unknown>, exportName?: string): ResolvedHandler {
     // Case 1: Explicit named export (e.g. "handler")
-    if (exportName && typeof mod[exportName] === "function") {
-        const fn = mod[exportName] as ClassicHandler;
-        return {
-            invoke: async (rawEvent, context) => {
-                const parsed = rawEvent && rawEvent.trim() ? JSON.parse(rawEvent) : {};
-                return { value: await fn(parsed, context) };
-            }
+    if (exportName && mod[exportName] !== undefined) {
+        const exported = mod[exportName];
+
+        // `export const app = { fetch(req) { ... } }` — an object exposing
+        // fetch is a fetch-style handler, whatever the export is called.
+        if (exported && typeof exported === "object" && typeof (exported as FetchStyleHandler).fetch === "function") {
+            const fetchFn = (exported as FetchStyleHandler).fetch.bind(exported);
+            return { invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context) };
         };
+
+        if (typeof exported === "function") {
+            // A handler named `fetch` takes a Request, not (event, context) —
+            // this is the "src/app.fetch" form.
+            if (exportName === "fetch") {
+                const fetchFn = exported as FetchStyleHandler["fetch"];
+                return { invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context) };
+            };
+
+            const fn = exported as ClassicHandler;
+            return {
+                invoke: async (rawEvent, context) => {
+                    const parsed = rawEvent && rawEvent.trim() ? JSON.parse(rawEvent) : {};
+                    return { value: await fn(parsed, context) };
+                }
+            };
+        };
+
+        throw new Error(`Export "${exportName}" is a ${typeof exported}, not a handler function or an object with a "fetch" method.`);
     };
 
     // Case 2: Default export is a function (classic handler as default)
@@ -126,6 +146,38 @@ async function invokeFetchHandler(fetchFn: FetchStyleHandler["fetch"], rawEvent:
 // ---------------------------------------------------------------------------
 // Runtime API helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Build the invocation context from the Runtime API response headers.
+ *
+ * Everything that is fixed for the life of the execution environment comes
+ * from the environment; only the per-invocation values come off the headers.
+ *
+ * @see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html#runtimes-api-next
+ */
+function buildContext(headers: Headers): LambdaContext {
+    const deadlineMs = Number(headers.get("lambda-runtime-deadline-ms")) || 0;
+
+    // X-Ray reads the active trace out of the environment, and it changes on
+    // every invocation — so it has to be refreshed each time round the loop.
+    const traceId = headers.get("lambda-runtime-trace-id");
+
+    if (traceId)
+        process.env._X_AMZN_TRACE_ID = traceId;
+    else
+        delete process.env._X_AMZN_TRACE_ID;
+
+    return {
+        awsRequestId: headers.get("lambda-runtime-aws-request-id") ?? "",
+        invokedFunctionArn: headers.get("lambda-runtime-invoked-function-arn") ?? "",
+        functionName: Bun.env.AWS_LAMBDA_FUNCTION_NAME ?? "",
+        functionVersion: Bun.env.AWS_LAMBDA_FUNCTION_VERSION ?? "$LATEST",
+        memoryLimitInMB: Bun.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE ?? "",
+        logGroupName: Bun.env.AWS_LAMBDA_LOG_GROUP_NAME ?? "",
+        logStreamName: Bun.env.AWS_LAMBDA_LOG_STREAM_NAME ?? "",
+        deadlineMs, getRemainingTimeInMillis: () => Math.max(0, deadlineMs - Date.now())
+    };
+};
 
 function runtimeApiBaseUrl(): string {
     const api = Bun.env.AWS_LAMBDA_RUNTIME_API;
