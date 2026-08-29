@@ -242,3 +242,60 @@ jobs:
           grep -q "bun-lambda-fixture" /tmp/response-fixture.json || { echo "Response did not match"; exit 1; }
           grep -q "Hello from template" /tmp/response-fixture.json || { echo "Template content did not match"; exit 1; }
           echo "Fixture bundle verified working on Lambda, config and template files loaded dynamically from disk."
+  test-named-fetch-export:
+    name: E2E Test - Named `fetch` Export (src/app.fetch)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create fixture with a named fetch export
+        run: |
+          mkdir -p /tmp/named-fetch/src
+          cat > /tmp/named-fetch/src/app.ts << 'EOF'
+          export async function fetch(request: Request): Promise<Response> {
+            const event = await request.json();
+            return new Response(
+              JSON.stringify({
+                message: "Hello from a named fetch export on Lambda",
+                requestId: request.headers.get("x-amzn-requestid"),
+                event,
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          EOF
+
+      - name: Build bootstrap zip
+        id: build
+        uses: ./
+        with:
+          arch: 'x86_64'
+          dir: '/tmp/named-fetch'
+          handler: 'src/app.fetch'
+          output: 'dist/bootstrap-named-fetch.zip'
+
+      - name: Run on real Lambda image (RIE) and invoke it
+        run: |
+          set -euo pipefail
+          EXTRACT_DIR=$(mktemp -d)
+          unzip -o "${{ steps.build.outputs.path }}" -d "${EXTRACT_DIR}"
+          chmod -R 755 "${EXTRACT_DIR}"
+
+          docker run --rm -d -p 9004:8080 -v "${EXTRACT_DIR}":/var/task:ro --name lambda-named-fetch public.ecr.aws/lambda/provided:al2023 bootstrap
+
+          sleep 3
+
+          HTTP_STATUS=$(curl -s -o /tmp/response-named-fetch.json -w "%{http_code}" -XPOST "http://localhost:9004/2015-03-31/functions/function/invocations" -d '{"probe": "named-fetch"}')
+
+          docker logs lambda-named-fetch
+          docker stop lambda-named-fetch
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          cat /tmp/response-named-fetch.json
+          echo ""
+
+          [ "${HTTP_STATUS}" -eq 200 ] || { echo "Invocation failed"; exit 1; }
+          grep -q "Hello from a named fetch export" /tmp/response-named-fetch.json || { echo "Response did not match"; exit 1; }
+          grep -q "named-fetch" /tmp/response-named-fetch.json || { echo "Event body did not round-trip"; exit 1; }
+          echo "Named fetch export verified: handler received a Request, not (event, context)."
