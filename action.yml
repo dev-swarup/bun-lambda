@@ -55,3 +55,12 @@ runs:
       uses: oven-sh/setup-bun@v2
       with:
         bun-version: ${{ inputs.bun-version }}
+
+    - name: Install dependencies
+      shell: bash
+      working-directory: ${{ inputs.dir }}
+      run: |
+        if [ -f "package.json" ]; then
+          echo "Found package.json, installing dependencies..."
+          bun install --production
+        fi
