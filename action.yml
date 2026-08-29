@@ -14,7 +14,7 @@ inputs:
   arch:
     default: 'x86_64'
     required: false
-    description: 'Target instruction architecture for the compiled binary ("x86_64" or "arm64").'
+    description: 'Target instruction architecture for the compiled binary ("x86_64", "x86_64-baseline" for pre-AVX2 hosts, or "arm64").'
   output:
     default: 'bootstrap.zip'
     required: false
@@ -31,6 +31,14 @@ inputs:
     default: 'false'
     required: false
     description: 'Emit inline source maps into the binary for deterministic production stack traces.'
+  minify:
+    default: 'true'
+    required: false
+    description: 'Minify the bundle before bytecode compilation. Disable to keep original identifiers in stack traces.'
+  install:
+    default: 'true'
+    required: false
+    description: 'Run "bun install" in the working directory before compiling. Disable when dependencies are already vendored.'
   files:
     default: ''
     required: false
@@ -41,8 +49,14 @@ outputs:
     value: ${{ steps.package.outputs.zip-path }}
     description: 'Absolute path to the packaged Lambda deployment zip.'
   size:
-    value: ${{ steps.package.outputs.binary-size }}
+    value: ${{ steps.compile.outputs.binary-size }}
     description: 'Binary size of the compiled standalone bootstrap executable.'
+  zip-size:
+    value: ${{ steps.package.outputs.zip-size }}
+    description: 'Size of the packaged deployment zip.'
+  checksum:
+    value: ${{ steps.package.outputs.checksum }}
+    description: 'SHA-256 checksum of the packaged deployment zip.'
   version:
     value: ${{ steps.setup-bun.outputs.bun-version }}
     description: 'Resolved Bun compiler version utilized during the build.'
@@ -56,11 +70,311 @@ runs:
       with:
         bun-version: ${{ inputs.bun-version }}
 
-    - name: Install dependencies
+    - id: resolve
+      name: Resolve build configuration
       shell: bash
-      working-directory: ${{ inputs.dir }}
+      env:
+        INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_DIR: ${{ inputs.dir }}
+        INPUT_HANDLER: ${{ inputs.handler }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        ACTION_INSTANCE: ${{ github.action }}
       run: |
-        if [ -f "package.json" ]; then
-          echo "Found package.json, installing dependencies..."
-          bun install --production
+        set -euo pipefail
+
+        case "${INPUT_ARCH}" in
+          x86_64|amd64|x64)             BUN_TARGET="bun-linux-x64" ;;
+          x86_64-baseline|x64-baseline) BUN_TARGET="bun-linux-x64-baseline" ;;
+          arm64|aarch64)                BUN_TARGET="bun-linux-arm64" ;;
+          *)
+            echo "::error::Unsupported arch '${INPUT_ARCH}'. Use 'x86_64', 'x86_64-baseline' or 'arm64'."
+            exit 1
+            ;;
+        esac
+
+        if [ -z "${INPUT_OUTPUT}" ]; then
+          echo "::error::'output' must not be empty."
+          exit 1
         fi
+
+        if [ ! -d "${INPUT_DIR}" ]; then
+          echo "::error::'dir' does not exist: ${INPUT_DIR}"
+          exit 1
+        fi
+
+        FUNC_ABS="$(cd "${INPUT_DIR}" && { pwd -W 2>/dev/null || pwd; })"
+
+        EXTENSIONS="ts tsx mts cts js jsx mjs cjs"
+
+        resolve_module() {
+          local base="$1" ext
+          [ -f "${base}" ] && { printf '%s' "${base}"; return 0; }
+          for ext in ${EXTENSIONS}; do
+            [ -f "${base}.${ext}" ] && { printf '%s' "${base}.${ext}"; return 0; }
+          done
+          for ext in ${EXTENSIONS}; do
+            [ -f "${base}/index.${ext}" ] && { printf '%s' "${base}/index.${ext}"; return 0; }
+          done
+          return 1
+        }
+
+        EXPORT_NAME=""
+        if MODULE_FILE="$(resolve_module "${FUNC_ABS}/${INPUT_HANDLER}")"; then
+          :
+        elif [[ "${INPUT_HANDLER}" == *.* ]] && MODULE_FILE="$(resolve_module "${FUNC_ABS}/${INPUT_HANDLER%.*}")"; then
+          EXPORT_NAME="${INPUT_HANDLER##*.}"
+        else
+          echo "::error::Could not resolve handler '${INPUT_HANDLER}' relative to ${FUNC_ABS}. Expected a module file with one of these extensions: ${EXTENSIONS}."
+          exit 1
+        fi
+
+        if [ -n "${EXPORT_NAME}" ] && ! [[ "${EXPORT_NAME}" =~ ^[A-Za-z_$][A-Za-z0-9_$]*$ ]]; then
+          echo "::error::Handler export '${EXPORT_NAME}' is not a valid JavaScript identifier."
+          exit 1
+        fi
+
+        STAGING="${RUNNER_TEMP}/bun-lambda-${ACTION_INSTANCE:-default}"
+        rm -rf "${STAGING}"
+        mkdir -p "${STAGING}/pkg"
+        STAGING="$(cd "${STAGING}" && { pwd -W 2>/dev/null || pwd; })"
+
+        {
+          echo "bun-target=${BUN_TARGET}"
+          echo "func-dir=${FUNC_ABS}"
+          echo "module-file=${MODULE_FILE}"
+          echo "export-name=${EXPORT_NAME}"
+          echo "staging=${STAGING}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "::group::Resolved build configuration"
+        echo "Handler : ${INPUT_HANDLER}"
+        echo "Module  : ${MODULE_FILE}"
+        echo "Export  : ${EXPORT_NAME:-<default>}"
+        echo "Target  : ${BUN_TARGET}"
+        echo "Staging : ${STAGING}"
+        echo "::endgroup::"
+
+    - name: Install dependencies
+      if: inputs.install != 'false'
+      shell: bash
+      working-directory: ${{ steps.resolve.outputs.func-dir }}
+      run: |
+        set -euo pipefail
+
+        if [ ! -f "package.json" ]; then
+          echo "No package.json found — skipping install."
+          exit 0
+        fi
+
+        INSTALL_FLAGS=(--production)
+        if [ -f "bun.lock" ] || [ -f "bun.lockb" ]; then
+          INSTALL_FLAGS+=(--frozen-lockfile)
+        fi
+
+        echo "::group::bun install ${INSTALL_FLAGS[*]}"
+        bun install "${INSTALL_FLAGS[@]}"
+        echo "::endgroup::"
+
+    - id: compile
+      name: Compile bootstrap binary
+      shell: bash
+      env:
+        STAGING: ${{ steps.resolve.outputs.staging }}
+        BUN_TARGET: ${{ steps.resolve.outputs.bun-target }}
+        MODULE_FILE: ${{ steps.resolve.outputs.module-file }}
+        EXPORT_NAME: ${{ steps.resolve.outputs.export-name }}
+        INPUT_SOURCEMAP: ${{ inputs.sourcemap }}
+        INPUT_MINIFY: ${{ inputs.minify }}
+        INPUT_ARCH: ${{ inputs.arch }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+
+        cp "${ACTION_PATH}/runtime/runtime.ts" "${STAGING}/runtime.ts"
+
+        ESCAPED_MODULE="${MODULE_FILE//\\/\\\\}"
+        ESCAPED_MODULE="${ESCAPED_MODULE//\"/\\\"}"
+
+        {
+          echo 'import { startRuntime } from "./runtime";'
+          echo "import * as handlerModule from \"${ESCAPED_MODULE}\";"
+          if [ -n "${EXPORT_NAME}" ]; then
+            echo "startRuntime(handlerModule, \"${EXPORT_NAME}\");"
+          else
+            echo 'startRuntime(handlerModule);'
+          fi
+        } > "${STAGING}/_entry.ts"
+
+        echo "::group::Generated entry point"
+        cat "${STAGING}/_entry.ts"
+        echo "::endgroup::"
+
+        COMPILE_FLAGS=(
+          --compile
+          --bytecode
+          "--target=${BUN_TARGET}"
+          "--outfile=${STAGING}/bootstrap"
+        )
+
+        if [ "${INPUT_MINIFY}" = "true" ]; then
+          COMPILE_FLAGS+=(--minify)
+        fi
+
+        if [ "${INPUT_SOURCEMAP}" = "true" ]; then
+          COMPILE_FLAGS+=(--sourcemap=inline)
+        fi
+
+        echo "::group::Compiling bootstrap binary"
+        cd "${STAGING}"
+        echo "bun build ${COMPILE_FLAGS[*]} _entry.ts"
+        bun build "${COMPILE_FLAGS[@]}" _entry.ts
+        echo "::endgroup::"
+
+        if [ ! -f "${STAGING}/bootstrap" ]; then
+          echo "::error::Compilation reported success but produced no bootstrap binary."
+          exit 1
+        fi
+        chmod +x "${STAGING}/bootstrap"
+
+        if command -v file > /dev/null 2>&1; then
+          FILE_INFO="$(file -b "${STAGING}/bootstrap")"
+          echo "Binary: ${FILE_INFO}"
+          case "${BUN_TARGET}" in
+            *arm64) EXPECTED="aarch64" ;;
+            *)      EXPECTED="x86-64" ;;
+          esac
+          if ! printf '%s' "${FILE_INFO}" | grep -qi -- "${EXPECTED}"; then
+            echo "::error::Compiled binary is not ${EXPECTED} as requested by arch '${INPUT_ARCH}': ${FILE_INFO}"
+            exit 1
+          fi
+        fi
+
+        BINARY_BYTES="$(wc -c < "${STAGING}/bootstrap" | tr -d '[:space:]')"
+        BINARY_SIZE="$(du -h "${STAGING}/bootstrap" | cut -f1)"
+        echo "Compiled bootstrap binary: ${BINARY_SIZE} (${BINARY_BYTES} bytes)"
+
+        {
+          echo "binary-size=${BINARY_SIZE}"
+          echo "binary-bytes=${BINARY_BYTES}"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: package
+      name: Package bootstrap zip
+      shell: bash
+      env:
+        STAGING: ${{ steps.resolve.outputs.staging }}
+        FUNC_DIR: ${{ steps.resolve.outputs.func-dir }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_FILES: ${{ inputs.files }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob globstar
+
+        PKG="${STAGING}/pkg"
+        cp "${STAGING}/bootstrap" "${PKG}/bootstrap"
+        chmod +x "${PKG}/bootstrap"
+
+        OUTPUT_DIR="$(dirname "${INPUT_OUTPUT}")"
+        mkdir -p "${OUTPUT_DIR}"
+        ABS_OUTPUT="$(cd "${OUTPUT_DIR}" && pwd)/$(basename "${INPUT_OUTPUT}")"
+        rm -f "${ABS_OUTPUT}"
+
+        if [ -n "${INPUT_FILES}" ]; then
+          echo "::group::Staging extra files"
+          cd "${FUNC_DIR}"
+
+          while IFS= read -r raw_line || [ -n "${raw_line}" ]; do
+            IFS=',' read -ra RAW_PATTERNS <<< "${raw_line}"
+            for raw_pattern in "${RAW_PATTERNS[@]}"; do
+              pattern="${raw_pattern#"${raw_pattern%%[![:space:]]*}"}"
+              pattern="${pattern%"${pattern##*[![:space:]]}"}"
+              pattern="${pattern#- }"
+              pattern="${pattern#-}"
+              pattern="${pattern#\"}"; pattern="${pattern%\"}"
+              pattern="${pattern#\'}"; pattern="${pattern%\'}"
+              [ -z "${pattern}" ] && continue
+
+              matches=(${pattern})
+              if [ ${#matches[@]} -eq 0 ]; then
+                echo "::warning::No files matched pattern '${pattern}'"
+                continue
+              fi
+
+              for match in "${matches[@]}"; do
+                if [ "${match}" = "bootstrap" ]; then
+                  echo "::warning::Refusing to overwrite the compiled bootstrap binary; skipped '${match}'."
+                  continue
+                fi
+                mkdir -p "${PKG}/$(dirname "${match}")"
+                cp -R "${match}" "${PKG}/${match}"
+                echo "Added: ${match}"
+              done
+            done
+          done <<< "${INPUT_FILES}"
+          echo "::endgroup::"
+        fi
+
+        find "${PKG}" -exec touch -h -t 198001010000 {} +
+        cd "${PKG}"
+        zip -r -q -9 -X "${ABS_OUTPUT}" .
+
+        if ! unzip -Z1 "${ABS_OUTPUT}" | grep -qx "bootstrap"; then
+          echo "::error::Packaged zip has no 'bootstrap' entry at its root — the provided.al2* runtimes will not start."
+          exit 1
+        fi
+
+        ZIP_BYTES="$(wc -c < "${ABS_OUTPUT}" | tr -d '[:space:]')"
+        ZIP_SIZE="$(du -h "${ABS_OUTPUT}" | cut -f1)"
+        CHECKSUM="$(sha256sum "${ABS_OUTPUT}" | cut -d' ' -f1)"
+
+        {
+          echo "zip-path=${ABS_OUTPUT}"
+          echo "zip-size=${ZIP_SIZE}"
+          echo "zip-bytes=${ZIP_BYTES}"
+          echo "checksum=${CHECKSUM}"
+        } >> "$GITHUB_OUTPUT"
+
+        echo "::group::Package contents"
+        unzip -l "${ABS_OUTPUT}"
+        echo "::endgroup::"
+        echo "Packaged ${ABS_OUTPUT} (${ZIP_SIZE}, sha256 ${CHECKSUM})"
+
+    - name: Write job summary
+      shell: bash
+      env:
+        BUN_VERSION: ${{ steps.setup-bun.outputs.bun-version }}
+        INPUT_ARCH: ${{ inputs.arch }}
+        INPUT_HANDLER: ${{ inputs.handler }}
+        INPUT_SOURCEMAP: ${{ inputs.sourcemap }}
+        INPUT_MINIFY: ${{ inputs.minify }}
+        MODULE_FILE: ${{ steps.resolve.outputs.module-file }}
+        BINARY_SIZE: ${{ steps.compile.outputs.binary-size }}
+        ZIP_SIZE: ${{ steps.package.outputs.zip-size }}
+        ZIP_PATH: ${{ steps.package.outputs.zip-path }}
+        CHECKSUM: ${{ steps.package.outputs.checksum }}
+      run: |
+        set -euo pipefail
+        [ -n "${GITHUB_STEP_SUMMARY:-}" ] || exit 0
+
+        OPTIMIZATIONS="bytecode"
+        if [ "${INPUT_MINIFY}" = "true" ]; then
+          OPTIMIZATIONS="${OPTIMIZATIONS}, minified"
+        fi
+        if [ "${INPUT_SOURCEMAP}" = "true" ]; then
+          OPTIMIZATIONS="${OPTIMIZATIONS}, inline sourcemap"
+        fi
+
+        {
+          echo "### ⚡ bun-lambda build complete"
+          echo ""
+          echo "| Property | Value |"
+          echo "|----------|-------|"
+          echo "| Bun version | \`${BUN_VERSION}\` |"
+          echo "| Architecture | \`${INPUT_ARCH}\` |"
+          echo "| Handler | \`${INPUT_HANDLER}\` → \`${MODULE_FILE}\` |"
+          echo "| Binary size | \`${BINARY_SIZE}\` |"
+          echo "| Zip size | \`${ZIP_SIZE}\` |"
+          echo "| Zip path | \`${ZIP_PATH}\` |"
+          echo "| SHA-256 | \`${CHECKSUM}\` |"
+          echo "| Optimizations | ${OPTIMIZATIONS} |"
+        } >> "$GITHUB_STEP_SUMMARY"
