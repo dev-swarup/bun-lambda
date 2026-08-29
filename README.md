@@ -205,12 +205,18 @@ export async function fetch(req: Request): Promise<Response> {
 | Input | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `bun-version` | `string` | `'latest'` | Target Bun compiler version (e.g. `'1.2.0'` or `'latest'`). |
-| `arch` | `string` | `'x86_64'` | Target instruction architecture for the compiled binary (`'x86_64'` or `'arm64'`). |
+| `arch` | `string` | `'x86_64'` | Target instruction architecture for the compiled binary (`'x86_64'`, `'x86_64-baseline'` or `'arm64'`). |
 | `output` | `string` | `'bootstrap.zip'` | Destination file path for the deployable Lambda deployment artifact. |
 | `dir` | `string` | `'.'` | Working directory containing handler source code and package manifests. |
 | `handler` | `string` | `'index.handler'` | Entrypoint handler signature (e.g. `'index.handler'` or `'src/app.fetch'`) resolved and bound at compile time. |
 | `sourcemap` | `string` | `'false'` | Emit inline source maps into the binary for deterministic production stack traces (`'true'` or `'false'`). |
+| `minify` | `string` | `'true'` | Minify the bundle before bytecode compilation. Set to `'false'` to keep original identifiers in stack traces. |
+| `install` | `string` | `'true'` | Run `bun install` in `dir` before compiling. Set to `'false'` when dependencies are already vendored. |
 | `files` | `string` | `''` | Static assets, engines, or config glob patterns to bundle in the deployment root (YAML list format or newline-separated). |
+
+`arch` accepts `'x86_64-baseline'` for the rare pre-AVX2 execution host; the
+default `'x86_64'` build is the faster one and is correct for current Lambda
+hardware.
 
 ### Outputs
 
@@ -218,7 +224,15 @@ export async function fetch(req: Request): Promise<Response> {
 | :--- | :--- |
 | `path` | Absolute filesystem path to the packaged Lambda deployment zip. |
 | `size` | Formatted binary size of the compiled standalone `bootstrap` executable. |
+| `zip-size` | Formatted size of the packaged deployment zip. |
+| `checksum` | SHA-256 checksum of the packaged deployment zip. |
 | `version` | Resolved Bun compiler version utilized during compilation. |
+
+Zip metadata is normalized (fixed entry timestamps, no uid/gid or extra
+attributes) so the archive does not churn on rebuild. Note that `bun build
+--compile` embeds a few bytes of build metadata in the binary, so two builds of
+identical sources are *not* byte-identical — treat `checksum` as an identifier
+for a specific artifact, not as a way to detect unchanged code.
 
 ---
 
