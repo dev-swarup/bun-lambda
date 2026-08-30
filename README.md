@@ -20,6 +20,8 @@ By leveraging Bun's Ahead-of-Time (AOT) compiler with embedded JavaScriptCore (J
 - [Handler Paradigms](#-handler-paradigms)
   - [1. Event-Driven Handler (Standard Lambda)](#1-event-driven-handler-standard-lambda)
   - [2. Fetch Handler (Web Standards / HTTP APIs)](#2-fetch-handler-web-standards--http-apis)
+  - [Built-in HTTP Adapter](#built-in-http-adapter)
+  - [3. Both Paradigms in One Module](#3-both-paradigms-in-one-module)
 - [Action Reference](#-action-reference)
   - [Inputs](#inputs)
   - [Outputs](#outputs)
@@ -196,6 +198,98 @@ export async function fetch(req: Request): Promise<Response> {
 }
 ```
 
+### Built-in HTTP Adapter
+
+Lambda delivers an HTTP call as a JSON *event*, not as a socket, which is why
+containers usually need the `aws-lambda-adapter` sidecar
+(`public.ecr.aws/awsguru/aws-lambda-adapter`) in front of a web server. The
+`bun-lambda` runtime carries that bridge itself: when an invocation carries an
+HTTP event, the event is turned into a real `Request` before your `fetch` runs,
+and the `Response` you return is turned back into the proxy result the caller
+expects. No sidecar, no extra process, no framework-specific glue.
+
+| Event source | Detected as | Response mapped to |
+| :--- | :--- | :--- |
+| Lambda Function URL, API Gateway HTTP API (payload 2.0) | `version: "2.0"` + `requestContext.http` | `statusCode`, `headers`, `cookies`, `body`, `isBase64Encoded` |
+| API Gateway REST API (payload 1.0) | `httpMethod` + `path` + `requestContext` | `statusCode`, `headers`, `multiValueHeaders`, `body`, `isBase64Encoded` |
+| Application Load Balancer | `requestContext.elb` | the above plus `statusDescription` |
+
+What the adapter reconstructs on the way in:
+
+- **URL** — scheme, host (`Host` header, else the API domain), path and raw
+  query string, so `new URL(request.url)` and URL-matching routers behave as
+  they would on any server.
+- **Headers** — `multiValueHeaders` when present (never both maps, which would
+  duplicate every header), and payload 2.0's `cookies` array folded back into a
+  single `Cookie` header.
+- **Body** — decoded from base64 when `isBase64Encoded` is set, and omitted for
+  `GET`/`HEAD`, where a body is not allowed.
+- **Query** — ALB values are left percent-encoded (ALB does not decode them);
+  API Gateway values are re-encoded exactly once.
+
+And on the way out:
+
+- **Text vs binary** — text-ish content types travel as UTF-8; anything else,
+  or anything with a `Content-Encoding`, is base64 encoded with
+  `isBase64Encoded: true`.
+- **Cookies** — repeated `Set-Cookie` headers are kept apart (`cookies` on
+  payload 2.0, `multiValueHeaders` on REST and ALB) rather than comma-joined
+  into one unparseable header.
+
+Anything that is *not* an HTTP event — SQS, S3, EventBridge, a direct
+`Invoke` — is passed to a `fetch` handler the way it always was: the raw event
+JSON as the request body, and your response body posted back byte for byte.
+Detection requires a `requestContext`, so a hand-written `{"httpMethod":"GET"}`
+test payload is never mistaken for a real request.
+
+The Lambda context arrives as the second argument, alongside the original event:
+
+```typescript
+export async function fetch(request: Request, context: any): Promise<Response> {
+  return Response.json({
+    requestId: context.awsRequestId,
+    msLeft: context.getRemainingTimeInMillis(),
+    stage: context.event?.requestContext?.stage,
+  });
+}
+```
+
+### 3. Both Paradigms in One Module
+
+A single module can serve HTTP through `fetch` and everything else through a
+classic handler. The runtime routes each invocation by event shape — exactly
+the split AWS makes for Node.js functions, without two deployments:
+
+```typescript
+// src/server.ts
+import { Hono } from "hono";
+
+const app = new Hono();
+app.get("/health", (c) => c.json({ ok: true }));
+
+// HTTP: Function URL, API Gateway or ALB requests land here.
+export const fetch = app.fetch;
+
+// Everything else: SQS batches, S3 notifications, EventBridge schedules, ...
+export const handler = async (event: any, context: any) => {
+  for (const record of event.Records ?? []) await process(record);
+  return { processed: event.Records?.length ?? 0 };
+};
+```
+
+| Module exports | HTTP event | Any other event |
+| :--- | :--- | :--- |
+| `fetch` + `handler` | `fetch(request, context)` | `handler(event, context)` |
+| `fetch` only | `fetch(request, context)` | `fetch(request, context)` with the raw event as the body |
+| `handler` only | `handler(event, context)` | `handler(event, context)` |
+
+The `handler` input names one of them explicitly (`src/server.fetch`,
+`src/server.handler`); the other is still picked up from the module, so pointing
+at either export keeps both paths working. When the `handler` input does not
+resolve at all, the `main` field of `package.json` is used as the entry module
+and the runtime picks the exports itself — so an app whose manifest already says
+`"main": "src/server.ts"` needs no `handler` input.
+
 ---
 
 ## 📖 Action Reference
@@ -208,7 +302,7 @@ export async function fetch(req: Request): Promise<Response> {
 | `arch` | `string` | `'x86_64'` | Target instruction architecture for the compiled binary (`'x86_64'`, `'x86_64-baseline'` or `'arm64'`). |
 | `output` | `string` | `'bootstrap.zip'` | Destination file path for the deployable Lambda deployment artifact. |
 | `dir` | `string` | `'.'` | Working directory containing handler source code and package manifests. |
-| `handler` | `string` | `'index.handler'` | Entrypoint handler signature (e.g. `'index.handler'` or `'src/app.fetch'`) resolved and bound at compile time. |
+| `handler` | `string` | `'index.handler'` | Entrypoint handler signature (e.g. `'index.handler'` or `'src/app.fetch'`) resolved and bound at compile time. Falls back to the `main` field of `package.json` when it does not resolve. |
 | `sourcemap` | `string` | `'false'` | Emit inline source maps into the binary for deterministic production stack traces (`'true'` or `'false'`). |
 | `minify` | `string` | `'true'` | Minify the bundle before bytecode compilation. Set to `'false'` to keep original identifiers in stack traces. |
 | `install` | `string` | `'true'` | Run `bun install` in `dir` before compiling. Set to `'false'` when dependencies are already vendored. |

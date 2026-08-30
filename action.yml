@@ -26,7 +26,7 @@ inputs:
   handler:
     default: 'index.handler'
     required: false
-    description: 'Entrypoint handler signature (e.g. "index.handler" or "src/app.fetch") resolved and bound at compile time.'
+    description: 'Entrypoint handler signature (e.g. "index.handler" or "src/app.fetch") resolved and bound at compile time. Falls back to the "main" field of package.json when it does not resolve.'
   sourcemap:
     default: 'false'
     required: false
@@ -54,6 +54,12 @@ outputs:
   zip-size:
     value: ${{ steps.package.outputs.zip-size }}
     description: 'Size of the packaged deployment zip.'
+  size-bytes:
+    value: ${{ steps.compile.outputs.binary-bytes }}
+    description: 'Exact size, in bytes, of the compiled standalone bootstrap executable.'
+  zip-size-bytes:
+    value: ${{ steps.package.outputs.zip-bytes }}
+    description: 'Exact size, in bytes, of the packaged deployment zip.'
   checksum:
     value: ${{ steps.package.outputs.checksum }}
     description: 'SHA-256 checksum of the packaged deployment zip.'
@@ -118,14 +124,36 @@ runs:
           return 1
         }
 
+        MODULE_FILE=""
         EXPORT_NAME=""
-        if MODULE_FILE="$(resolve_module "${FUNC_ABS}/${INPUT_HANDLER}")"; then
-          :
-        elif [[ "${INPUT_HANDLER}" == *.* ]] && MODULE_FILE="$(resolve_module "${FUNC_ABS}/${INPUT_HANDLER%.*}")"; then
-          EXPORT_NAME="${INPUT_HANDLER##*.}"
-        else
-          echo "::error::Could not resolve handler '${INPUT_HANDLER}' relative to ${FUNC_ABS}. Expected a module file with one of these extensions: ${EXTENSIONS}."
-          exit 1
+
+        resolve_spec() {
+          local spec="$1" file
+          if [ -z "${spec}" ]; then return 1; fi
+
+          if file="$(resolve_module "${FUNC_ABS}/${spec}")"; then
+            MODULE_FILE="${file}"; EXPORT_NAME=""; return 0
+          fi
+
+          if [[ "${spec}" == *.* ]] && file="$(resolve_module "${FUNC_ABS}/${spec%.*}")"; then
+            MODULE_FILE="${file}"; EXPORT_NAME="${spec##*.}"; return 0
+          fi
+
+          return 1
+        }
+
+        PKG_MAIN=""
+        if [ -f "${FUNC_ABS}/package.json" ]; then
+          PKG_MAIN="$(cd "${FUNC_ABS}" && bun -e 'const m = require("./package.json").main; process.stdout.write(typeof m === "string" ? m : "")' 2>/dev/null || true)"
+        fi
+
+        if ! resolve_spec "${INPUT_HANDLER}"; then
+          if resolve_spec "${PKG_MAIN}"; then
+            echo "::notice::Handler '${INPUT_HANDLER}' did not resolve; using package.json \"main\": ${PKG_MAIN}"
+          else
+            echo "::error::Could not resolve handler '${INPUT_HANDLER}' relative to ${FUNC_ABS}${PKG_MAIN:+ (package.json \"main\" of \"${PKG_MAIN}\" did not resolve either)}. Expected a module file with one of these extensions: ${EXTENSIONS}."
+            exit 1
+          fi
         fi
 
         if [ -n "${EXPORT_NAME}" ] && ! [[ "${EXPORT_NAME}" =~ ^[A-Za-z_$][A-Za-z0-9_$]*$ ]]; then
@@ -190,7 +218,7 @@ runs:
       run: |
         set -euo pipefail
 
-        cp "${ACTION_PATH}/runtime/runtime.ts" "${STAGING}/runtime.ts"
+        cp "${ACTION_PATH}"/runtime/*.ts "${STAGING}/"
 
         ESCAPED_MODULE="${MODULE_FILE//\\/\\\\}"
         ESCAPED_MODULE="${ESCAPED_MODULE//\"/\\\"}"
@@ -305,8 +333,13 @@ runs:
                   echo "::warning::Refusing to overwrite the compiled bootstrap binary; skipped '${match}'."
                   continue
                 fi
-                mkdir -p "${PKG}/$(dirname "${match}")"
-                cp -R "${match}" "${PKG}/${match}"
+                if [ -d "${match}" ]; then
+                  mkdir -p "${PKG}/${match}"
+                  cp -R "${match}/." "${PKG}/${match}/"
+                else
+                  mkdir -p "${PKG}/$(dirname "${match}")"
+                  cp "${match}" "${PKG}/${match}"
+                fi
                 echo "Added: ${match}"
               done
             done
@@ -316,7 +349,8 @@ runs:
 
         find "${PKG}" -exec touch -h -t 198001010000 {} +
         cd "${PKG}"
-        zip -r -q -9 -X "${ABS_OUTPUT}" .
+
+        find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort | zip -q -9 -X -@ "${ABS_OUTPUT}"
 
         if ! unzip -Z1 "${ABS_OUTPUT}" | grep -qx "bootstrap"; then
           echo "::error::Packaged zip has no 'bootstrap' entry at its root — the provided.al2* runtimes will not start."

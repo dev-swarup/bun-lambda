@@ -1,17 +1,22 @@
 /**
  * Bun Lambda Runtime — Lambda Runtime API Loop
  *
- * Pre-compiled with `bun build --compile --bytecode` for maximum
- * cold start performance. The compiled binary serves as the Lambda
- * `bootstrap` executable directly — no shell script, no separate
- * Bun binary, no TypeScript parsing at startup.
+ * Pre-compiled with `bun build --compile --bytecode` for maximum cold start performance. 
+ * The compiled binary serves as the Lambda `bootstrap` executable directly — no shell script, no separate Bun binary, no TypeScript parsing at startup.
  *
  * @see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html
  */
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
+import { detectHttpEvent, fromResponse, mayBeHttpEvent, toRequest, type HttpEventKind } from "./http";
+
+// Lambda fixes these for the life of the execution environment, so they are read once at module load instead of on every trip round the loop.
+const ENV = {
+    functionName: Bun.env.AWS_LAMBDA_FUNCTION_NAME ?? "",
+    functionVersion: Bun.env.AWS_LAMBDA_FUNCTION_VERSION ?? "$LATEST",
+    memoryLimitInMB: Bun.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE ?? "",
+    logGroupName: Bun.env.AWS_LAMBDA_LOG_GROUP_NAME ?? "",
+    logStreamName: Bun.env.AWS_LAMBDA_LOG_STREAM_NAME ?? ""
+};
 
 interface LambdaContext {
     functionName: string;
@@ -27,8 +32,15 @@ interface LambdaContext {
 
 type ClassicHandler = (event: unknown, context: LambdaContext) => Promise<unknown>;
 
+// Second argument to a fetch handler; `event` is set when the runtime had to parse the event anyway, i.e. on every adapted HTTP invocation.
+interface FetchContext extends LambdaContext {
+    event?: unknown;
+}
+
+type FetchHandler = (request: Request, context: FetchContext) => Promise<Response> | Response;
+
 interface FetchStyleHandler {
-    fetch: (request: Request) => Promise<Response> | Response;
+    fetch: FetchHandler;
 }
 
 // A handler's result is either:
@@ -39,95 +51,116 @@ interface FetchStyleHandler {
 type InvokeResult = { raw: string } | { value: unknown };
 
 interface ResolvedHandler {
+    mode: "fetch" | "classic" | "fetch+classic";
     invoke: (rawEvent: string, context: LambdaContext) => Promise<InvokeResult>;
 }
 
-// ---------------------------------------------------------------------------
-// Handler Resolution (from pre-imported module)
-// ---------------------------------------------------------------------------
-
 /**
- * Resolve a handler from an already-imported module.
- *
- * Since `bun build --compile` bundles all imports at compile time,
- * the user's handler module is statically imported by the generated
- * entry point and passed here. No dynamic import() needed at runtime.
- *
- * Supports:
- *   - Named export function (e.g. `export const handler = ...`)
- *   - Default export function (e.g. `export default async (event) => ...`)
- *   - Default export with fetch method (e.g. `export default { fetch(req) { ... } }`)
- *   - Module-level fetch export (e.g. `export function fetch(req) { ... }`)
- *
- * Each invocation's body arrives as `rawEvent`, the exact text the Lambda
- * Runtime API sent us — already valid JSON, since that's the invoke contract.
- * Classic handlers need it parsed into an object, so we parse it once here.
- * Fetch-style handlers just want a body to hand to `Request`, so we pass
- * `rawEvent` straight through with no parse/stringify round trip.
+ * Pick out whichever handlers the module exposes: a fetch handler (`export default { fetch }`, `export function fetch`, or a named export with a `fetch` method) and a classic one (`handler`, or a default export function).
+ * A named export claims its own kind; the other is still taken from the module's conventional exports, so both can live in one module.
  */
-function resolveHandler(mod: Record<string, unknown>, exportName?: string): ResolvedHandler {
-    // Case 1: Explicit named export (e.g. "handler")
+function selectExports(mod: Record<string, unknown>, exportName?: string): { fetchFn?: FetchHandler; classicFn?: ClassicHandler } {
+    let fetchFn: FetchHandler | undefined;
+    let classicFn: ClassicHandler | undefined;
+
     if (exportName && mod[exportName] !== undefined) {
         const exported = mod[exportName];
 
-        // `export const app = { fetch(req) { ... } }` — an object exposing
-        // fetch is a fetch-style handler, whatever the export is called.
-        if (exported && typeof exported === "object" && typeof (exported as FetchStyleHandler).fetch === "function") {
-            const fetchFn = (exported as FetchStyleHandler).fetch.bind(exported);
-            return { invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context) };
-        };
-
-        if (typeof exported === "function") {
-            // A handler named `fetch` takes a Request, not (event, context) —
-            // this is the "src/app.fetch" form.
-            if (exportName === "fetch") {
-                const fetchFn = exported as FetchStyleHandler["fetch"];
-                return { invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context) };
-            };
-
-            const fn = exported as ClassicHandler;
-            return {
-                invoke: async (rawEvent, context) => {
-                    const parsed = rawEvent && rawEvent.trim() ? JSON.parse(rawEvent) : {};
-                    return { value: await fn(parsed, context) };
-                }
-            };
-        };
-
-        throw new Error(`Export "${exportName}" is a ${typeof exported}, not a handler function or an object with a "fetch" method.`);
+        // Any object with a fetch method is fetch-style, whatever it is called.
+        if (exported && typeof exported === "object" && typeof (exported as FetchStyleHandler).fetch === "function")
+            fetchFn = (exported as FetchStyleHandler).fetch.bind(exported);
+        else if (typeof exported === "function") {
+            // "src/app.fetch" — a handler named fetch takes a Request, not (event, context).
+            if (exportName === "fetch")
+                fetchFn = exported as FetchHandler;
+            else
+                classicFn = exported as ClassicHandler;
+        } else throw new Error(`Export "${exportName}" is a ${typeof exported}, not a handler function or an object with a "fetch" method.`);
     };
 
-    // Case 2: Default export is a function (classic handler as default)
-    if (typeof mod.default === "function") {
-        const fn = mod.default as ClassicHandler;
-        return {
-            invoke: async (rawEvent, context) => {
-                const parsed = rawEvent && rawEvent.trim() ? JSON.parse(rawEvent) : {};
-                return { value: await fn(parsed, context) };
-            }
-        };
+    if (!fetchFn) {
+        if (typeof mod.fetch === "function")
+            fetchFn = mod.fetch as FetchHandler;
+        else if (mod.default && typeof mod.default === "object" && typeof (mod.default as FetchStyleHandler).fetch === "function")
+            fetchFn = (mod.default as FetchStyleHandler).fetch.bind(mod.default);
     };
 
-    // Case 3: Default export has a `fetch` method (Bun fetch-style handler)
-    if (mod.default && typeof mod.default === "object" && typeof (mod.default as FetchStyleHandler).fetch === "function") {
-        const fetchHandler = mod.default as FetchStyleHandler;
-        return {
-            invoke: (rawEvent, context) => invokeFetchHandler(fetchHandler.fetch, rawEvent, context)
-        };
+    if (!classicFn) {
+        if (typeof mod.handler === "function")
+            classicFn = mod.handler as ClassicHandler;
+        else if (typeof mod.default === "function")
+            classicFn = mod.default as ClassicHandler;
     };
 
-    // Case 4: Module-level `fetch` export
-    if (typeof mod.fetch === "function") {
-        const fetchFn = mod.fetch as FetchStyleHandler["fetch"];
-        return {
-            invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context)
-        };
-    };
-
-    throw new Error(`Could not resolve handler from module. Expected a named export "${exportName || "handler"}", a default export function, or a default export with a "fetch" method.`);
+    return { fetchFn, classicFn };
 };
 
-async function invokeFetchHandler(fetchFn: FetchStyleHandler["fetch"], rawEvent: string, context: LambdaContext): Promise<InvokeResult> {
+/**
+ * Bind the module's exports to an invocation strategy.
+ *
+ * `bun build --compile` bundles the handler module at compile time, so the generated entry point imports it statically and hands it over here — no dynamic import() at runtime. 
+ * `rawEvent` is the invocation body as the Runtime API sent it, parsed only as far as the chosen strategy needs.
+ */
+function resolveHandler(mod: Record<string, unknown>, exportName?: string): ResolvedHandler {
+    const { fetchFn, classicFn } = selectExports(mod, exportName);
+
+    // Both in one module: the event shape decides which one runs.
+    if (fetchFn && classicFn)
+        return {
+            mode: "fetch+classic",
+            invoke: async (rawEvent, context) => {
+                const event = parseEvent(rawEvent);
+                const kind = detectHttpEvent(event);
+
+                return kind ? invokeHttpHandler(fetchFn, kind, event, context) : { value: await classicFn(event, context) };
+            }
+        };
+
+    if (fetchFn)
+        return {
+            mode: "fetch",
+            invoke: (rawEvent, context) => invokeFetchHandler(fetchFn, rawEvent, context)
+        };
+
+    if (classicFn)
+        return {
+            mode: "classic",
+            invoke: async (rawEvent, context) => ({ value: await classicFn(parseEvent(rawEvent), context) })
+        };
+
+    throw new Error(`Could not resolve handler from module. Expected a named export "${exportName || "handler"}", a default export function, or a "fetch" export (module-level or on the default export).`);
+};
+
+function parseEvent(rawEvent: string): unknown {
+    // Scan for the first non-whitespace byte rather than rawEvent.trim(), which copies the whole (up to 6 MB) payload just to answer "is it blank?".
+    for (let i = 0; i < rawEvent.length; i++) {
+        const code = rawEvent.charCodeAt(i);
+
+        // JSON whitespace is exactly space, tab, LF and CR.
+        if (code !== 32 && code !== 9 && code !== 10 && code !== 13) return JSON.parse(rawEvent);
+    };
+
+    return {};
+};
+
+/** The adapter path: event in as a `Request`, proxy result out of a `Response`. */
+async function invokeHttpHandler(fetchFn: FetchHandler, kind: HttpEventKind, event: unknown, context: LambdaContext): Promise<InvokeResult> {
+    const request = toRequest(kind, event as Record<string, any>, context.awsRequestId);
+
+    // The context is built fresh for this invocation, so it can carry the parsed event without spreading a copy of it.
+    (context as FetchContext).event = event;
+    return { value: await fromResponse(kind, await fetchFn(request, context)) };
+};
+
+async function invokeFetchHandler(fetchFn: FetchHandler, rawEvent: string, context: LambdaContext): Promise<InvokeResult> {
+    if (mayBeHttpEvent(rawEvent)) {
+        const event = parseEvent(rawEvent);
+        const kind = detectHttpEvent(event);
+
+        if (kind) return invokeHttpHandler(fetchFn, kind, event, context);
+    };
+
+    // Not HTTP: the event is the request body, and the response body is posted back byte for byte.
     const request = new Request(`https://lambda.local/${context.awsRequestId}`, {
         method: "POST",
         headers: {
@@ -138,28 +171,23 @@ async function invokeFetchHandler(fetchFn: FetchStyleHandler["fetch"], rawEvent:
         body: rawEvent
     });
 
-    const response = await fetchFn(request);
+    const response = await fetchFn(request, context);
     const raw = await response.text();
-    return { raw };
-};
 
-// ---------------------------------------------------------------------------
-// Runtime API helpers
-// ---------------------------------------------------------------------------
+    // A bodiless Response (204, `new Response(null)`) would otherwise post nothing at all, leaving the caller a zero-byte payload where JSON is expected.
+    return { raw: raw || "null" };
+};
 
 /**
  * Build the invocation context from the Runtime API response headers.
- *
- * Everything that is fixed for the life of the execution environment comes
- * from the environment; only the per-invocation values come off the headers.
+ * Everything that is fixed for the life of the execution environment comes from the environment; only the per-invocation values come off the headers.
  *
  * @see https://docs.aws.amazon.com/lambda/latest/dg/runtimes-api.html#runtimes-api-next
  */
 function buildContext(headers: Headers): LambdaContext {
     const deadlineMs = Number(headers.get("lambda-runtime-deadline-ms")) || 0;
 
-    // X-Ray reads the active trace out of the environment, and it changes on
-    // every invocation — so it has to be refreshed each time round the loop.
+    // X-Ray reads the active trace out of the environment, and it changes on every invocation — so it has to be refreshed each time round the loop.
     const traceId = headers.get("lambda-runtime-trace-id");
 
     if (traceId)
@@ -170,11 +198,11 @@ function buildContext(headers: Headers): LambdaContext {
     return {
         awsRequestId: headers.get("lambda-runtime-aws-request-id") ?? "",
         invokedFunctionArn: headers.get("lambda-runtime-invoked-function-arn") ?? "",
-        functionName: Bun.env.AWS_LAMBDA_FUNCTION_NAME ?? "",
-        functionVersion: Bun.env.AWS_LAMBDA_FUNCTION_VERSION ?? "$LATEST",
-        memoryLimitInMB: Bun.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE ?? "",
-        logGroupName: Bun.env.AWS_LAMBDA_LOG_GROUP_NAME ?? "",
-        logStreamName: Bun.env.AWS_LAMBDA_LOG_STREAM_NAME ?? "",
+        functionName: ENV.functionName,
+        functionVersion: ENV.functionVersion,
+        memoryLimitInMB: ENV.memoryLimitInMB,
+        logGroupName: ENV.logGroupName,
+        logStreamName: ENV.logStreamName,
         deadlineMs, getRemainingTimeInMillis: () => Math.max(0, deadlineMs - Date.now())
     };
 };
@@ -184,6 +212,36 @@ function runtimeApiBaseUrl(): string {
     if (!api) throw new Error("AWS_LAMBDA_RUNTIME_API is not set. This binary must run inside the Lambda execution environment.");
 
     return `http://${api}/2018-06-01`;
+};
+
+// The invocation currently being served. A crash that escapes the handler's promise chain has no other way to name the request it belongs to.
+let inFlightRequestId: string | undefined;
+
+/**
+ * Trap the failures that never reach the invocation's `catch`: a throw inside a `setTimeout` callback, an unawaited promise that rejects, an "error" event with no listener.
+ *
+ * Bun tears the process down for these, and Lambda simply never hears back — the invocation hangs until the function's configured timeout, billed in full, and the caller waits minutes for what was an immediate error.
+ * Reporting first turns that into a normal error response. This is what the managed Node runtime does too.
+ */
+function installCrashHandlers(baseUrl: string): void {
+    const fatal = (errorType: string) => async (err: unknown): Promise<void> => {
+        const error = err instanceof Error ? err : new Error(String(err));
+        console.error(`[lambda] ${errorType}:`, error);
+
+        const requestId = inFlightRequestId;
+        inFlightRequestId = undefined;
+
+        if (requestId)
+            try {
+                await reportError(`${baseUrl}/runtime/invocation/${requestId}/error`, error, errorType);
+            } catch (reportErr) { console.error("[lambda] Failed to report fatal error:", reportErr); };
+
+        // Whatever state the crash left behind is not worth reusing; exiting has Lambda build a fresh execution environment for the next invocation.
+        process.exit(1);
+    };
+
+    process.on("uncaughtException", fatal("Runtime.UncaughtException"));
+    process.on("unhandledRejection", fatal("Runtime.UnhandledRejection"));
 };
 
 async function reportError(url: string, error: Error, errorType: string = "Runtime.HandlerError"): Promise<void> {
@@ -203,10 +261,6 @@ async function reportError(url: string, error: Error, errorType: string = "Runti
     if (!response.ok) console.error(`[lambda] Runtime API rejected error report: ${response.status} ${response.statusText}`);
 };
 
-// ---------------------------------------------------------------------------
-// Public API — called from the generated entry point
-// ---------------------------------------------------------------------------
-
 /**
  * Start the Lambda Runtime API loop.
  *
@@ -221,12 +275,14 @@ export async function startRuntime(mod: Record<string, unknown>, exportName?: st
         process.exit(1);
     };
 
+    installCrashHandlers(baseUrl);
+
     // Initialization phase
     let handler: ResolvedHandler;
 
     try {
         handler = resolveHandler(mod, exportName);
-        console.log("[lambda] Runtime ready (compiled bytecode)");
+        console.log(`[lambda] Runtime ready (compiled bytecode, ${handler.mode} handler)`);
     } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         console.error(`[lambda] Failed to resolve handler:`, error);
@@ -246,7 +302,18 @@ export async function startRuntime(mod: Record<string, unknown>, exportName?: st
             // 1. Get next invocation (blocks until an event is available)
             const nextResponse = await fetch(`${baseUrl}/runtime/invocation/next`);
             const context = buildContext(nextResponse.headers);
+
+            // No invocation was handed out, so there is nothing to run and nothing to report an error against.
+            // Drain the body to free the connection and back off, rather than invoking the handler on a failure payload.
+            if (!nextResponse.ok || !context.awsRequestId) {
+                console.error(`[lambda] Runtime API /next returned ${nextResponse.status} ${nextResponse.statusText}${context.awsRequestId ? "" : " with no request id"}`);
+                await nextResponse.text();
+                await Bun.sleep(100);
+                continue;
+            };
+
             requestId = context.awsRequestId;
+            inFlightRequestId = requestId;
 
             // Read the body once, as text. Classic handlers parse it themselves;
             // fetch-style handlers pass it straight through as their Request body.
@@ -274,16 +341,17 @@ export async function startRuntime(mod: Record<string, unknown>, exportName?: st
                 try {
                     await reportError(`${baseUrl}/runtime/invocation/${requestId}/error`, error);
                 } catch (reportErr) {
-                    // Reporting failed too. Log and move on to the next invocation —
-                    // one bad round trip should never take down the whole runtime.
+                    // Reporting failed too. Log and move on to the next invocation — one bad round trip should never take down the whole runtime.
                     console.error("[lambda] Failed to report invocation error:", reportErr);
                 }
             else {
-                // We failed before getting a request id (e.g. the Runtime API itself
-                // was unreachable). There's nothing to report against, so back off
-                // briefly instead of hammering it in a tight loop.
+                // We failed before getting a request id (e.g. the Runtime API itself was unreachable).
+                // There's nothing to report against, so back off briefly instead of hammering it in a tight loop.
                 await Bun.sleep(250);
             };
+        } finally {
+            // This invocation is settled either way, so a later crash must not be reported against it.
+            inFlightRequestId = undefined;
         };
     };
 };
